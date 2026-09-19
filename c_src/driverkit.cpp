@@ -196,35 +196,89 @@ void input_callback(void* context, IOReturn result, void* sender, IOHIDValueRef 
     write(fd[1], &e, sizeof(struct DKEvent));
 }
 
-void device_connected_callback(void* context, io_iterator_t iter) {
-    uint64_t device_hash = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(context));
+// Name as seen by the Rust side: product name cut at the first NUL, since
+// CString-based registration/exclusion can never carry an embedded NUL.
+static std::string device_name_for_matching(mach_port_t device) {
+    std::string name = get_product_name(device);
+    auto nul = name.find('\0');
+    if (nul != std::string::npos) name.erase(nul);
+    return name;
+}
+
+static bool is_karabiner_name(const std::string& name) {
+    return name.find("Karabiner") != std::string::npos;
+}
+
+// Virtual keyboards that must not be seized in register-all mode. Seizing
+// Sidecar's virtual keyboard aborts the process. An explicit
+// register_device(name) still allows them.
+static bool is_skipped_in_register_all(const std::string& name) {
+    std::string lower = name;
+    for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return lower.find("sidecar") != std::string::npos;
+}
+
+bool any_device_registered() {
+    return register_all_devices
+        || !registered_devices_hashes.empty()
+        || !registered_device_vidpids.empty()
+        || !registered_device_names.empty();
+}
+
+/*
+ * Single source of truth for "should this keyboard be seized?". Used both
+ * for devices present at grab() time and for devices that appear later.
+ */
+bool device_wanted(mach_port_t device, uint64_t hash) {
+    std::string name = device_name_for_matching(device);
+    if (is_karabiner_name(name)) return false;
+    if (excluded_devices_hashes.count(hash)) return false;
+    if (!name.empty() && excluded_device_names.count(name)) return false;
+    if (registered_devices_hashes.count(hash)) return true;
+    if (!name.empty() && registered_device_names.count(name)) return true;
+    uint32_t vid = get_number_property(device, kIOHIDVendorIDKey);
+    uint32_t pid = get_number_property(device, kIOHIDProductIDKey);
+    uint64_t vidpid = (static_cast<uint64_t>(vid) << 32) | pid;
+    if (registered_device_vidpids.count(vidpid)) return true;
+    if (register_all_devices && !name.empty() && !is_skipped_in_register_all(name)) return true;
+    return false;
+}
+
+/*
+ * Called by IOKit (on the listener run loop) with every keyboard that
+ * matches the keyboards dictionary: once with the devices present when the
+ * notification was armed, then again for every device connected later.
+ */
+void hotplug_device_callback(void*, io_iterator_t iter) {
     for (mach_port_t curr = IOIteratorNext(iter); curr; curr = IOIteratorNext(iter)) {
         uint64_t curr_hash = hash_device(curr);
-        if ( curr_hash == device_hash )
-            capture_device(IOHIDDeviceCreate(kCFAllocatorDefault, curr), curr_hash);
+        if (device_wanted(curr, curr_hash)) {
+            IOHIDDeviceRef ref = IOHIDDeviceCreate(kCFAllocatorDefault, curr);
+            if (ref && capture_device(ref, curr_hash))
+                std::cout << "captured device: " << device_name_for_matching(curr)
+                          << " hash: " << std::hex << curr_hash << std::dec << std::endl;
+        }
         IOObjectRelease(curr);
     }
 }
 
-void device_connected_vidpid_callback(void* context, io_iterator_t iter) {
-    uint64_t vidpid = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(context));
-    uint32_t vid = static_cast<uint32_t>(vidpid >> 32);
-    uint32_t pid = static_cast<uint32_t>(vidpid & 0xFFFFFFFF);
-    CFStringRef karabiner = from_cstr("Karabiner");
-    for (mach_port_t curr = IOIteratorNext(iter); curr; curr = IOIteratorNext(iter)) {
-        uint32_t curr_vid = get_number_property(curr, kIOHIDVendorIDKey);
-        uint32_t curr_pid = get_number_property(curr, kIOHIDProductIDKey);
-        if (curr_vid == vid && curr_pid == pid) {
-            CFStringRef name = get_product_name_cf(curr);
-            if (name && !isSubstring(karabiner, name)) {
-                uint64_t curr_hash = hash_device(curr);
-                capture_device(IOHIDDeviceCreate(kCFAllocatorDefault, curr), curr_hash);
-            }
-            if (name) CFRelease(name);
+/*
+ * Called by IOKit when a seized device disappears. Drops our reference so
+ * the map only holds live devices; when the device comes back the hotplug
+ * callback seizes it again.
+ */
+void device_removal_callback(void*, IOReturn, void* sender) {
+    IOHIDDeviceRef removed = static_cast<IOHIDDeviceRef>(sender);
+    for (auto it = opened_device_refs.begin(); it != opened_device_refs.end(); ) {
+        if (it->second == removed) {
+            IOHIDDeviceUnscheduleFromRunLoop(it->second, listener_loop, kCFRunLoopDefaultMode);
+            IOHIDDeviceClose(it->second, kIOHIDOptionsTypeSeizeDevice); // device is gone; error is expected
+            CFRelease(it->second);
+            it = opened_device_refs.erase(it);
+        } else {
+            ++it;
         }
-        IOObjectRelease(curr);
     }
-    CFRelease(karabiner);
 }
 
 void close_registered_devices() {
@@ -267,14 +321,21 @@ bool consume_devices(Func consume) {
     return result;
 }
 
-void subscribe_to_notification(const char* notification_type, void* cb_arg, callback_type callback) {
+void subscribe_hotplug() {
     io_iterator_t iter = IO_OBJECT_NULL;
-    CFRetain(matching_dictionary);
-    kern_return_t kr = IOServiceAddMatchingNotification(notification_port, notification_type,
-                       matching_dictionary, callback, cb_arg, &iter);
-    if (kr != KERN_SUCCESS) { print_iokit_error(notification_type, kr); return; }
-    for (io_object_t obj = IOIteratorNext(iter); obj; obj = IOIteratorNext(iter))
-        IOObjectRelease(obj);
+    CFRetain(matching_dictionary); // IOServiceAddMatchingNotification consumes one reference
+    kern_return_t kr = IOServiceAddMatchingNotification(notification_port, kIOMatchedNotification,
+                       matching_dictionary, hotplug_device_callback, nullptr, &iter);
+    if (kr != KERN_SUCCESS) { print_iokit_error(kIOMatchedNotification, kr); return; }
+    notification_iterators.push_back(iter);
+    // Arming the notification requires draining the iterator; doing it through
+    // the callback captures the devices that are already connected.
+    hotplug_device_callback(nullptr, iter);
+}
+
+void cancel_notifications() {
+    for (io_iterator_t iter : notification_iterators) IOObjectRelease(iter);
+    notification_iterators.clear();
 }
 
 bool capture_device(IOHIDDeviceRef device_ref, uint64_t device_hash) {
@@ -286,47 +347,21 @@ bool capture_device(IOHIDDeviceRef device_ref, uint64_t device_hash) {
     }
     void* ctx = reinterpret_cast<void*>(static_cast<uintptr_t>(device_hash));
     IOHIDDeviceRegisterInputValueCallback(device_ref, input_callback, ctx);
+    IOHIDDeviceRegisterRemovalCallback(device_ref, device_removal_callback, nullptr);
     IOHIDDeviceScheduleWithRunLoop(device_ref, listener_loop, kCFRunLoopDefaultMode);
-    opened_device_refs[device_hash] = device_ref;
+    opened_device_refs.emplace(device_hash, device_ref);
     return true;
 }
 
 bool capture_registered_devices() {
-    // Register the notification port to the run loop, essential for receiving re-connect events so we can re-capture devices
+    // Register the notification port to the run loop, essential for receiving (re)connect events.
     CFRunLoopAddSource(listener_loop, IONotificationPortGetRunLoopSource(notification_port), kCFRunLoopDefaultMode);
-    // Try to capture devices that are already connected
-    bool any_captured = consume_devices([](mach_port_t c) {
-        uint64_t device_hash = hash_device(c);
-        // Match by hash
-        if ( registered_devices_hashes.find(device_hash) != registered_devices_hashes.end() ) {
-            return capture_device(IOHIDDeviceCreate(kCFAllocatorDefault, c), device_hash);
-        }
-        // Match by VID:PID
-        uint32_t vid = get_number_property(c, kIOHIDVendorIDKey);
-        uint32_t pid = get_number_property(c, kIOHIDProductIDKey);
-        uint64_t vidpid = (static_cast<uint64_t>(vid) << 32) | pid;
-        if ( registered_device_vidpids.find(vidpid) != registered_device_vidpids.end() ) {
-            CFStringRef name = get_product_name_cf(c);
-            CFStringRef karabiner = from_cstr("Karabiner");
-            bool is_karabiner = name && isSubstring(karabiner, name);
-            release_strings(karabiner, name);
-            if (!is_karabiner) {
-                return capture_device(IOHIDDeviceCreate(kCFAllocatorDefault, c), device_hash);
-            }
-        }
-        return false;
-    });
-    // Subscribe to notifications for ALL registered devices, regardless of whether they are currently connected.
-    // This ensures that devices which appear later (e.g. plugged in after startup) are automatically captured.
-    for (auto hash : registered_devices_hashes) {
-        void* dev_hash = reinterpret_cast<void*>(static_cast<uintptr_t>(hash));
-        subscribe_to_notification(kIOMatchedNotification, dev_hash, device_connected_callback);
-    }
-    for (auto vidpid : registered_device_vidpids) {
-        void* ctx = reinterpret_cast<void*>(static_cast<uintptr_t>(vidpid));
-        subscribe_to_notification(kIOMatchedNotification, ctx, device_connected_vidpid_callback);
-    }
-    return any_captured;
+    init_keyboards_dictionary();
+    // One subscription covers every keyboard: the devices present now are
+    // captured while arming it, and any keyboard connected later goes through
+    // the same device_wanted() decision.
+    subscribe_hotplug();
+    return !opened_device_refs.empty();
 }
 
 IOHIDDeviceRef get_device_by_hash(uint64_t device_hash) {
@@ -366,6 +401,8 @@ extern "C" {
      * product_kye is null         => register all devices
      * product_key specified       => register the device that matches product_key  */
     bool register_device(const char* product_key) {
+        if (product_key) registered_device_names.insert(product_key);
+        else register_all_devices = true;
         return consume_devices([product_key](mach_port_t current_device) {
             CFStringRef product_key_cfstring = product_key ? from_cstr(product_key) : from_cstr("");
             CFStringRef karabiner            = from_cstr("Karabiner"); //Karabiner DriverKit VirtualHIDKeyboard 1.7.0
@@ -450,6 +487,39 @@ extern "C" {
      * Loads a the karabiner kernel extension that will send key events
      * back to the OS.
      */
+    bool register_device_hash(uint64_t device_hash) {
+        // Always register the hash so that the device will be captured when
+        // it appears, even if it is not currently connected.
+        registered_devices_hashes.insert(device_hash);
+        // Check if the device is currently connected (for the return value).
+        return consume_devices([device_hash](mach_port_t current_device) {
+            if (is_karabiner_name(device_name_for_matching(current_device))) return false;
+            return hash_device(current_device) == device_hash;
+        });
+    }
+
+    /*
+     * Marks a device (by product name) as never-to-be-seized. Meant to be
+     * paired with register_device(NULL): seize every keyboard except these,
+     * including keyboards connected after grab(). Returns whether a matching
+     * device is currently connected.
+     */
+    bool exclude_device(const char* product_key) {
+        if (!product_key) return false;
+        std::string name = product_key;
+        excluded_device_names.insert(name);
+        return consume_devices([&name](mach_port_t current_device) {
+            return device_name_for_matching(current_device) == name;
+        });
+    }
+
+    bool exclude_device_hash(uint64_t device_hash) {
+        excluded_devices_hashes.insert(device_hash);
+        return consume_devices([device_hash](mach_port_t current_device) {
+            return hash_device(current_device) == device_hash;
+        });
+    }
+
     bool register_device_vidpid(uint32_t vendor_id, uint32_t product_id) {
         uint64_t vidpid = (static_cast<uint64_t>(vendor_id) << 32) | product_id;
         registered_device_vidpids.insert(vidpid);
@@ -467,7 +537,7 @@ extern "C" {
     }
 
     int grab() {
-        if (!registered_devices_hashes.size() && !registered_device_vidpids.size()) {
+        if (!any_device_registered()) {
             std::cout << "At least one device has to be registered via register_device()" << std::endl;
             return 1;
         }
@@ -487,6 +557,7 @@ extern "C" {
     void release() {
         std::cout << "release called" << std::endl;
         if(listener_thread.joinable()) { CFRunLoopStop(listener_loop); listener_thread.join(); }
+        cancel_notifications();
         close_registered_devices();
         keyboard.keys.clear();
         close(fd[0]); close(fd[1]);
@@ -574,6 +645,7 @@ extern "C" {
             CFRunLoopStop(listener_loop);
             listener_thread.join();
         }
+        cancel_notifications();
         close_registered_devices();
         keyboard.keys.clear();
         close(fd[0]); close(fd[1]);
@@ -589,7 +661,7 @@ extern "C" {
         #ifdef USE_KEXT
         return true;
         #else
-        if (!registered_devices_hashes.size() && !registered_device_vidpids.size()) return false;
+        if (!any_device_registered()) return false;
         if (pipe(fd) == -1) { std::cerr << "pipe error: " << errno << std::endl; return false; }
         fire_listener_thread();
         return true;

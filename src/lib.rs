@@ -18,6 +18,8 @@ mod interface {
         pub fn device_matches(product: *mut c_char) -> bool;
         pub fn register_device(product: *mut c_char) -> bool;
         pub fn register_device_hash(hash: u64) -> bool;
+        pub fn exclude_device(product: *mut c_char) -> bool;
+        pub fn exclude_device_hash(hash: u64) -> bool;
         pub fn register_device_vidpid(vendor_id: u32, product_id: u32) -> bool;
         pub fn get_device_list(array_length: *mut usize) -> *const DeviceData;
         pub fn is_sink_ready() -> bool;
@@ -184,6 +186,28 @@ pub fn register_device(input: &str) -> bool {
     } else {
         // println!("Registering device with product key: {}", input);
         register_device_str(input)
+    }
+}
+
+/// Marks a device as never-to-be-seized, by product name or by `0x`-prefixed
+/// hex hash (same syntax as `register_device`). Meant to be paired with
+/// `register_device("")`: every keyboard except the excluded ones is seized,
+/// including keyboards that are connected after `grab()`.
+///
+/// Returns whether a matching device is currently connected. Must be called
+/// before `grab()`.
+pub fn exclude_device(input: &str) -> bool {
+    if let Some(hash) = parse_register_request(input) {
+        unsafe { interface::exclude_device_hash(hash) }
+    } else {
+        let c_str_ptr = CString::new(input)
+            .expect("CString::new failed")
+            .into_raw();
+        let ret = unsafe { interface::exclude_device(c_str_ptr) };
+        unsafe {
+            let _ = CString::from_raw(c_str_ptr);
+        }
+        ret
     }
 }
 

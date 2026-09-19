@@ -7,7 +7,10 @@
 #include <filesystem> // Include this before virtual_hid_device_service.hpp to avoid compile error
 #include <IOKit/hid/IOHIDLib.h>
 #include <IOKit/hidsystem/IOHIDShared.h>
+#include <cctype>
 #include <set>
+#include <string>
+#include <vector>
 #include <unordered_map>
 
 /* The name was changed from "Master" to "Main" in Apple SDK 12.0 (Monterey) */
@@ -53,10 +56,24 @@ std::thread listener_thread;
 CFRunLoopRef listener_loop;
 std::set<uint64_t> registered_devices_hashes;
 std::set<uint64_t> registered_device_vidpids;
+// Product names registered via register_device(name). Kept so that a device
+// with a registered name that is plugged in *after* grab() is still captured.
+std::set<std::string> registered_device_names;
+// Devices that must never be captured, even in register-all mode.
+std::set<uint64_t> excluded_devices_hashes;
+std::set<std::string> excluded_device_names;
+// Set by register_device(NULL): capture every keyboard that is not excluded,
+// including keyboards that appear after grab().
+bool register_all_devices = false;
+// Iterators returned by IOServiceAddMatchingNotification. Releasing them
+// cancels the subscription; done on release()/release_input_only() so a
+// later regrab_input() does not stack duplicate subscriptions.
+std::vector<io_iterator_t> notification_iterators;
 // Maps device hash → the IOHIDDeviceRef that was opened with kIOHIDOptionsTypeSeizeDevice.
 // close_registered_devices() must close the SAME ref that capture_device() opened;
 // creating a new ref via IOHIDDeviceCreate() and closing that does NOT release the seizure.
-std::unordered_map<uint64_t, IOHIDDeviceRef> opened_device_refs;
+// A multimap because two identical keyboards produce the same hash.
+std::unordered_multimap<uint64_t, IOHIDDeviceRef> opened_device_refs;
 
 int fd[2];
 CFMutableDictionaryRef matching_dictionary = NULL;
@@ -88,9 +105,12 @@ struct DeviceData {
 };
 
 using callback_type = void(*)(void*, io_iterator_t);
-void subscribe_to_notification(const char* notification_type, void* cb_arg, callback_type callback);
-void device_connected_callback(void* context, io_iterator_t iter);
-void device_connected_vidpid_callback(void* context, io_iterator_t iter);
+void hotplug_device_callback(void* context, io_iterator_t iter);
+void device_removal_callback(void* context, IOReturn result, void* sender);
+void subscribe_hotplug();
+void cancel_notifications();
+bool device_wanted(mach_port_t device, uint64_t hash);
+bool any_device_registered();
 void fire_listener_thread();
 void init_keyboards_dictionary();
 void close_registered_devices();
@@ -214,22 +234,9 @@ extern "C" {
     bool driver_activated();
     bool register_device(const char* product_key);
     bool register_device_vidpid(uint32_t vendor_id, uint32_t product_id);
-    bool register_device_hash(uint64_t device_hash) {
-        // Always register the hash so that the device will be captured when
-        // it appears, even if it is not currently connected.
-        registered_devices_hashes.insert(device_hash);
-        // Check if the device is currently connected (for the return value).
-        return consume_devices([device_hash](mach_port_t current_device) {
-            // Don't match karabiner devices
-            CFStringRef name = get_product_name_cf(current_device);
-            if( isSubstring(from_cstr("Karabiner"), name) ) {
-                if (name) CFRelease(name);
-                return false;
-            }
-            if (name) CFRelease(name);
-            return hash_device(current_device) == device_hash;
-        });
-    }
+    bool register_device_hash(uint64_t device_hash);
+    bool exclude_device(const char* product_key);
+    bool exclude_device_hash(uint64_t device_hash);
     const DeviceData* get_device_list(size_t* array_length);
 
     bool is_sink_ready();
